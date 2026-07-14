@@ -129,11 +129,41 @@
         (is @start-was-called)
         (is @decoder-was-set)))))
 
-(def mock-modes {:api-server     {:start-fn (constantly nil) :stop-fn (constantly nil)}
-                 :stream-worker  {:start-fn (constantly nil) :stop-fn (constantly nil)}
-                 :worker         {:start-fn (constantly nil) :stop-fn (constantly nil)}
-                 :batch-worker   {:start-fn (constantly nil) :stop-fn (constantly nil)}
-                 :management-api {:start-fn (constantly nil) :stop-fn (constantly nil)}})
+(deftest stop-stops-application-states-in-dependency-order-test
+  (testing "stop tears down all application states in dependency order irrespective of modes: ingestion stops and rabbitmq consumers drain before the shared connections and kafka producers are closed"
+    (let [stopped-states (atom [])]
+      (with-redefs [mount/stop              (fn [& states] (swap! stopped-states into (map str states)))
+                    init/stop-common-states (constantly nil)]
+        (init/stop (constantly nil) [:api-server :worker :stream-worker])
+        (is (= ["#'ziggurat.server/server"
+                "#'ziggurat.streams/stream"
+                "#'ziggurat.kafka-consumer.consumer-driver/consumer-groups"
+                "#'ziggurat.kafka-consumer.executor-service/thread-pool"
+                "#'ziggurat.messaging.consumer/consumers"
+                "#'ziggurat.messaging.consumer-connection/consumer-connection"
+                "#'ziggurat.messaging.channel-pool/channel-pool"
+                "#'ziggurat.messaging.producer-connection/producer-connection"
+                "#'ziggurat.producer/kafka-producers"]
+               @stopped-states))))))
+
+(deftest stop-is-independent-of-modes-test
+  (testing "the same states are stopped no matter which modes the application was started with, since stopping a never-started state is a no-op"
+    (let [stop-calls-with-all-modes (atom 0)
+          stop-calls-with-no-modes  (atom 0)]
+      (with-redefs [mount/stop              (fn [& _] (swap! stop-calls-with-all-modes inc))
+                    init/stop-common-states (constantly nil)]
+        (init/stop (constantly nil) [:api-server :stream-worker :worker :batch-worker :management-api]))
+      (with-redefs [mount/stop              (fn [& _] (swap! stop-calls-with-no-modes inc))
+                    init/stop-common-states (constantly nil)]
+        (init/stop (constantly nil) nil))
+      (is (pos? @stop-calls-with-all-modes))
+      (is (= @stop-calls-with-all-modes @stop-calls-with-no-modes)))))
+
+(def mock-modes {:api-server     {:start-fn (constantly nil)}
+                 :stream-worker  {:start-fn (constantly nil)}
+                 :worker         {:start-fn (constantly nil)}
+                 :batch-worker   {:start-fn (constantly nil)}
+                 :management-api {:start-fn (constantly nil)}})
 
 (deftest batch-routes-test
   (testing "Main function should start batch consumption if batch-routes are provided and the modes vector is empty (arity: 1)"
@@ -323,14 +353,57 @@
             (is (thrown? IllegalArgumentException (init/validate-routes stream-routes batch-routes modes)))))))))
 
 (deftest stop-test
-  (testing "the following components execute-function -> actor-stop-fn -> stop-common-states should be stopped"
-    (let [is-execute-function-called?   (atom false)
-          is-actor-stop-fn-called?      (atom false)
-          is-stop-common-states-called? (atom false)
-          actor-stop-fn                 (fn [] (reset! is-actor-stop-fn-called? true))]
-      (with-redefs [init/execute-function   (fn [_ _] (reset! is-execute-function-called? true))
-                    init/stop-common-states (fn [] (reset! is-stop-common-states-called? true))]
+  (testing "the following components stop-application-states -> actor-stop-fn -> stop-common-states should be stopped in order"
+    (let [call-order    (atom [])
+          actor-stop-fn (fn [] (swap! call-order conj :actor-stop-fn))]
+      (with-redefs [init/stop-application-states (fn [] (swap! call-order conj :stop-application-states))
+                    init/stop-common-states      (fn [] (swap! call-order conj :stop-common-states))]
         (init/stop actor-stop-fn {})
-        (is (true? @is-execute-function-called?))
-        (is (true? @is-actor-stop-fn-called?))
-        (is (true? @is-stop-common-states-called?))))))
+        (is (= [:stop-application-states :actor-stop-fn :stop-common-states] @call-order))))))
+
+(defn- capture-stopped-states
+  "Runs stop-fn with mount stubbed out and returns the set of state vars (as
+   strings) it asked mount to stop. Handles both `(mount/stop var ...)` and the
+   `(-> (mount/only #{...}) (mount/stop))` call shapes."
+  [stop-fn]
+  (let [stopped (atom #{})]
+    (with-redefs [mount/only (fn [states] states)
+                  mount/stop (fn [& args]
+                               (let [vars (if (and (= 1 (count args)) (set? (first args)))
+                                            (first args)
+                                            args)]
+                                 (swap! stopped into (map str vars))))]
+      (stop-fn))
+    @stopped))
+
+(deftest stop-server-test
+  (testing "stop-server stops the http server and the consumer connection"
+    (is (= #{"#'ziggurat.server/server"
+             "#'ziggurat.messaging.consumer-connection/consumer-connection"}
+           (capture-stopped-states init/stop-server)))))
+
+(deftest stop-management-apis-test
+  (testing "stop-management-apis stops only the http server"
+    (is (= #{"#'ziggurat.server/server"}
+           (capture-stopped-states init/stop-management-apis)))))
+
+(deftest stop-stream-test
+  (testing "stop-stream stops the kafka streams and the kafka producers"
+    (is (= #{"#'ziggurat.streams/stream"
+             "#'ziggurat.producer/kafka-producers"}
+           (capture-stopped-states init/stop-stream)))))
+
+(deftest stop-workers-test
+  (testing "stop-workers stops the rabbitmq consumers, the shared producer connections and the kafka producers"
+    (is (= #{"#'ziggurat.messaging.consumer-connection/consumer-connection"
+             "#'ziggurat.messaging.consumer/consumers"
+             "#'ziggurat.messaging.producer-connection/producer-connection"
+             "#'ziggurat.messaging.channel-pool/channel-pool"
+             "#'ziggurat.producer/kafka-producers"}
+           (capture-stopped-states init/stop-workers)))))
+
+(deftest stop-batch-consumer-test
+  (testing "stop-batch-consumer stops the executor thread pool and the consumer groups"
+    (is (= #{"#'ziggurat.kafka-consumer.executor-service/thread-pool"
+             "#'ziggurat.kafka-consumer.consumer-driver/consumer-groups"}
+           (capture-stopped-states init/stop-batch-consumer)))))

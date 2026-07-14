@@ -118,12 +118,13 @@
                     #'consumer-driver/consumer-groups})
       (mount/stop)))
 
+;; No :stop-fn: stopping is unified via `stop-application-states`, not dispatched per mode.
 (def valid-modes-fns
-  {:api-server     {:start-fn start-server :stop-fn stop-server}
-   :stream-worker  {:start-fn start-stream :stop-fn stop-stream}
-   :worker         {:start-fn start-workers :stop-fn stop-workers}
-   :batch-worker   {:start-fn start-batch-consumer :stop-fn stop-batch-consumer}
-   :management-api {:start-fn start-management-apis :stop-fn stop-management-apis}})
+  {:api-server     {:start-fn start-server}
+   :stream-worker  {:start-fn start-stream}
+   :worker         {:start-fn start-workers}
+   :batch-worker   {:start-fn start-batch-consumer}
+   :management-api {:start-fn start-management-apis}})
 
 (defn- valid-modes []
   (keys valid-modes-fns))
@@ -132,15 +133,11 @@
   (remove #(= % :batch-worker) (valid-modes)))
 
 (defn- execute-function
-  ([modes fnk]
-   (execute-function modes fnk nil))
-  ([modes fnk args]
-   (doseq [mode (-> modes
-                    (or (valid-modes))
-                    sort)]
-     (if (nil? args)
-       ((fnk (get valid-modes-fns mode)))
-       ((fnk (get valid-modes-fns mode)) args)))))
+  [modes fnk args]
+  (doseq [mode (-> modes
+                   (or (valid-modes))
+                   sort)]
+    ((fnk (get valid-modes-fns mode)) args)))
 
 (defn initialize-config []
   (start* #{#'config/config})
@@ -168,10 +165,31 @@
                      :stream-routes stream-routes
                      :batch-routes  batch-routes}))
 
+(defn- stop-application-states
+  "Stops all application states in dependency order (no-op for never-started
+   states, so safe for any mode combination): stop ingestion (server, streams,
+   batch consumers), then drain rabbitmq subscribers, then close the shared
+   connections and producers those handlers publish through. Separate mount/stop
+   calls are required because mount orders a single call by namespace load order,
+   not argument order."
+  []
+  (mount/stop #'server/server)
+  (mount/stop #'streams/stream)
+  (mount/stop #'consumer-driver/consumer-groups)
+  (mount/stop #'executor-service/thread-pool)
+  (mount/stop #'messaging-consumer/consumers)
+  (mount/stop #'consumer-connection)
+  (mount/stop #'cpool/channel-pool)
+  (mount/stop #'producer-connection)
+  (mount/stop #'kafka-producers))
+
 (defn stop
-  "Calls the Ziggurat's state stop fns and then actor-stop-fn."
-  [actor-stop-fn modes]
-  (execute-function modes :stop-fn)
+  "Stops all of Ziggurat's application states in dependency order and then
+   calls actor-stop-fn. The modes the application was started with do not
+   affect the stop order; states belonging to modes that were never started
+   stop as no-ops."
+  [actor-stop-fn _modes]
+  (stop-application-states)
   (actor-stop-fn)
   (stop-common-states))
 
