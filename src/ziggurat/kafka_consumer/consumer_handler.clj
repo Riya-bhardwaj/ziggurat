@@ -4,6 +4,8 @@
             [ziggurat.messaging.producer :as producer]
             [ziggurat.message-payload :refer [map->MessagePayload]]
             [ziggurat.metrics :as metrics]
+            [ziggurat.new-relic :as nr]
+            [ziggurat.util.error :refer [report-error]]
             [cambium.core :as clog])
   (:import (org.apache.kafka.common.errors WakeupException)
            (java.time Duration Instant)
@@ -45,32 +47,36 @@
 
 (defn process
   [batch-handler batch-payload]
-  (let [batch               (:message batch-payload)
-        topic-entity        (:topic-entity batch-payload)
-        current-retry-count (:retry-count batch-payload)
-        batch-size          (count batch)]
-    (try
-      (when (not-empty batch)
-        (clog/info {:batch-size batch-size} (format "[Consumer Group: %s] Processing the batch with %d messages" topic-entity batch-size))
-        (let [start-time           (Instant/now)
-              result               (batch-handler batch)
-              time-taken-in-millis (.toMillis (Duration/between start-time (Instant/now)))]
-          (validate-batch-processing-result result)
-          (let [messages-to-be-retried (:retry result)
-                to-be-retried-count    (count messages-to-be-retried)
-                skip-count             (count (:skip result))
-                success-count          (- batch-size (+ to-be-retried-count skip-count))]
+  (let [batch                       (:message batch-payload)
+        topic-entity                (:topic-entity batch-payload)
+        topic-entity-name           (name topic-entity)
+        new-relic-transaction-name  (str topic-entity-name ".batch-handler-fn")
+        current-retry-count         (:retry-count batch-payload)
+        batch-size                  (count batch)]
+    (nr/with-tracing "job" new-relic-transaction-name
+      (try
+        (when (not-empty batch)
+          (clog/info {:batch-size batch-size} (format "[Consumer Group: %s] Processing the batch with %d messages" topic-entity batch-size))
+          (let [start-time           (Instant/now)
+                result               (batch-handler batch)
+                time-taken-in-millis (.toMillis (Duration/between start-time (Instant/now)))]
+            (validate-batch-processing-result result)
+            (let [messages-to-be-retried (:retry result)
+                  to-be-retried-count    (count messages-to-be-retried)
+                  skip-count             (count (:skip result))
+                  success-count          (- batch-size (+ to-be-retried-count skip-count))]
 
-            (clog/info {:messages-successfully-processed success-count :messages-skipped skip-count :messages-to-be-retried to-be-retried-count} (format "[Consumer Group: %s] Processed the batch with success: [%d], skip: [%d] and retries: [%d] \n" topic-entity success-count skip-count to-be-retried-count))
-            (publish-batch-process-metrics topic-entity batch-size success-count skip-count to-be-retried-count time-taken-in-millis)
-            (retry messages-to-be-retried current-retry-count topic-entity))))
-      (catch InvalidReturnTypeException e
-        (throw e))
-      (catch Exception e
-        (do
-          (metrics/increment-count batch-consumption-metric-ns "exception" batch-size {:topic-entity (name topic-entity)})
-          (log/errorf e "[Consumer Group: %s] Exception received while processing messages \n" topic-entity)
-          (retry batch-payload))))))
+              (clog/info {:messages-successfully-processed success-count :messages-skipped skip-count :messages-to-be-retried to-be-retried-count} (format "[Consumer Group: %s] Processed the batch with success: [%d], skip: [%d] and retries: [%d] \n" topic-entity success-count skip-count to-be-retried-count))
+              (publish-batch-process-metrics topic-entity batch-size success-count skip-count to-be-retried-count time-taken-in-millis)
+              (retry messages-to-be-retried current-retry-count topic-entity))))
+        (catch InvalidReturnTypeException e
+          (throw e))
+        (catch Exception e
+          (do
+            (metrics/increment-count batch-consumption-metric-ns "exception" batch-size {:topic-entity topic-entity-name})
+            (log/errorf e "[Consumer Group: %s] Exception received while processing messages \n" topic-entity)
+            (report-error e (str "Batch handler execution failed for " topic-entity-name))
+            (retry batch-payload)))))))
 
 (defn commit-offsets
   "Synchronously commits the current consumer offsets. Invoked only when a batch route is

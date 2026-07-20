@@ -5,7 +5,8 @@
             [ziggurat.config :refer :all]
             [ziggurat.fixtures :as fix]
             [ziggurat.messaging.producer :as producer]
-            [ziggurat.metrics :as metrics])
+            [ziggurat.metrics :as metrics]
+            [ziggurat.util.error :refer [report-error]])
   (:import (org.apache.kafka.clients.consumer Consumer ConsumerRecords ConsumerRecord)
            (org.apache.kafka.common.errors WakeupException)
            (java.time Duration)
@@ -167,7 +168,43 @@
     (let [processed      (atom false)
           batch-handler  (fn [_] (reset! processed true) {:retry [] :skip []})]
       (ch/process batch-handler (mp/map->MessagePayload {:message [] :topic-entity :consumer-1 :retry-count nil}))
-      (is (false? @processed)))))
+      (is (false? @processed))))
+  (testing "should report handler exception to New Relic via report-error"
+    (let [report-fn-called? (atom false)
+          batch-size         3
+          batch-handler      (fn [_] (throw (Exception. "handler blew up")))]
+      (with-redefs [metrics/increment-count (constantly nil)
+                    ch/retry                 (constantly nil)
+                    report-error             (fn [_ _] (reset! report-fn-called? true))]
+        (ch/process batch-handler (mp/map->MessagePayload {:message      (vec (replicate batch-size 0))
+                                                           :topic-entity :consumer-1
+                                                           :retry-count  nil}))
+        (is (true? @report-fn-called?)
+            "handler exceptions must be reported to NR's Errors Inbox, matching stream-route behaviour"))))
+  (testing "should NOT call report-error when the handler succeeds"
+    (let [report-fn-called? (atom false)
+          batch-size         3
+          batch-handler      (fn [_] {:retry [] :skip []})]
+      (with-redefs [metrics/increment-count (constantly nil)
+                    metrics/report-time     (constantly nil)
+                    report-error            (fn [_ _] (reset! report-fn-called? true))]
+        (ch/process batch-handler (mp/map->MessagePayload {:message      (vec (replicate batch-size 0))
+                                                           :topic-entity :consumer-1
+                                                           :retry-count  nil}))
+        (is (false? @report-fn-called?)
+            "successful batches must not spam NR's Errors Inbox"))))
+  (testing "should still trigger retry when handler throws (regression guard for NR wrap)"
+    (let [retry-called? (atom false)
+          batch-size    3
+          batch-handler (fn [_] (throw (Exception. "handler blew up")))]
+      (with-redefs [metrics/increment-count (constantly nil)
+                    report-error            (constantly nil)
+                    ch/retry                (fn [_] (reset! retry-called? true))]
+        (ch/process batch-handler (mp/map->MessagePayload {:message      (vec (replicate batch-size 0))
+                                                           :topic-entity :consumer-1
+                                                           :retry-count  nil}))
+        (is (true? @retry-called?)
+            "NR wrapping must not swallow the exception path that leads to retry")))))
 
 (deftest retry-test
   (testing "when batch handler returns non-empty retry vector those message should be added to rabbitmq retry queue"
